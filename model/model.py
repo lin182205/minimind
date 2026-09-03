@@ -1,4 +1,6 @@
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast
+from transformers.activations import ACT2FN
 
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
@@ -42,11 +44,11 @@ class MiniMindConfig(PretrainedConfig):
 #
 import torch 
 import torch.nn as nn
-import math
+import math , torch.nn.functional as F
 
-class RMSNorm(nn.module):
+class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
-        super().__(init)__()
+        super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
@@ -57,7 +59,7 @@ class RMSNorm(nn.module):
         return (self.weight * self.norm(x.float())).type_as(x)
 
 def Precompute_freqs_cis(dim: int, end: int = 32*1024, rope_base: float = 1e6, rope_scaling: dict = None):
-    freqs, attn_factor = 1.0 / (rope_base ** (torch.arrange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0
+    freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0
     if rope_scaling is not None: #YaRN
         beta_fast, beta_slow, factor, origin_max, attn_factor = (
             rope_scaling.get("beta_fast", 32.0), rope_scaling.get("beta_slow", 1.0), 
@@ -68,9 +70,9 @@ def Precompute_freqs_cis(dim: int, end: int = 32*1024, rope_base: float = 1e6, r
         if end > origin_max:
             inv_dim = lambda b: (dim * math.log(origin_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
             low, high = max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
-            ramp =  torch.clamp((torch.arrange(0, dim//2, device = freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
+            ramp =  torch.clamp((torch.arange(0, dim//2, device = freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
             freqs = freqs * (1- ramp + ramp / factor)
-    t = torch.arrange(end, device = freqs.device)
+    t = torch.arange(end, device = freqs.device)
     freqs = torch.outer(t, freqs).float()
     freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim = -1) * attn_factor
     freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim = -1) * attn_factor
@@ -108,5 +110,106 @@ class Attention(nn.Module):
         self.dropout = config.dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
 
-    def forward()
+    def forward(self, x : torch.Tensor, 
+                positon_embeddings: tuple[torch.Tensor, torch.Tensor],
+                past_key_value = None,
+                use_cache = False,
+                attention_mask = None):
+        bsz, seq_len, _ = x.shape
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xq, xk = self.q_norm(xq), self.k_norm(xk)
+        cos, sin = positon_embeddings
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+        if past_key_value is not None:
+            xk = torch.cat([past_key_value[0], xk], dim = 1)
+            xv = torch.cat([past_key_value[1], xv], dim = 1)
+        past_kv = (xk, xv) if use_cache else None
+        xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
+        if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
+        else:
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
+            if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+            output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output))
+        return output, past_kv
 
+class FeedForward(nn.Module):
+    """FFN层"""
+    def __init__(self, config: MiniMindConfig,  intermediate_size: int = None) -> torch.Tensor:
+        super().__init__()
+        intermediate_size = intermediate_size or config.intermediate_size
+        self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias= False)
+        self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias = False)
+        self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias = False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+class MoeFeedForward(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        self.experts = nn.ModuleList([FeedForward(config, intermediate_size= config.moe_intermediate_size) for _ in range(config.num_experts)])
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        batch_size, seq_len, hidden_dim = x.shape
+        x_flat = x.view(-1, hidden_dim)
+        scores = F.softmax(self.gate(x_flat), dim = -1)
+        topk_weight, topk_idx = torch.topk(scores, k = self.config.num_experts_per_tok, dim=-1, sorted=False)
+        if self.config.norm_topk_prob: topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
+        y = torch.zeros_like(x_flat)
+        for i, expert in enumerate(self.experts):
+            mask = (topk_idx == i)
+            if mask.any():
+                token_idx = mask.any(dim=-1).nonzero().flatten()
+                token_weight = topk_weight[mask].view(-1, 1)
+                y.index_add_(0, token_idx, (expert(x_flat[token_idx]) * token_weight).to(y.dtype))
+            elif self.training:
+                y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
+        if self.training and self.config.router_aux_loss_coef > 0:
+            load = F.one_hot(topk_idx, self.config.num_experts).float().mean(0)
+            self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
+        else:
+            self.aux_loss = scores.new_zeros(1).squeeze()
+            return y.view(batch_size, seq_len, hidden_dim)
+
+class MiniMindBlock(nn.Module):
+    def __init__(self, layer_id: int, config: MiniMindConfig):
+        super().__init__()
+        self.self_attn = Attention(config)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps= config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps= config.rms_norm_eps)
+        self.mlp = FeedForward(config) if not config.use_moe else MoeFeedForward(config)
+
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        residual = hidden_states
+        hidden_states, present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states), position_embeddings,
+            past_key_value, use_cache, attention_mask
+        )
+        hidden_states += residual
+        hidden_states = self.mlp(self.post_attention_layernorm(hidden_states)) + hidden_states
+        return hidden_states, present_key_value
+
+class MiniMindModel(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        freqs_cos, freqs_sin = Precompute_freqs_cis(dim=config.head_dim, end=config.max_position_embeddings, rope_base=config.rope_theta, rope_scaling=config.rope_scaling)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+        
