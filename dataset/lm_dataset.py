@@ -31,11 +31,7 @@ class PretrainDataset(Dataset):
         labels = input_ids.clone()
         labels[input_ids == self.tokenizer.pad_token_id] = -100
 
-        attenion_mask = (input_ids != self.tokenizer.pad_token_id).long()
+        # attenion_mask = (input_ids != self.tokenizer.pad_token_id).long()
         
-        return {
-            "input_ids": input_ids,
-            "labels": labels,
-            "attention_mask": attenion_mask
-        }
+        return  input_ids, labels
 

@@ -235,7 +235,7 @@ class MiniMindModel(nn.Module):
             )
             presents.append(present)
         hidden_states = self.norm(hidden_states)
-        aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
+        aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MoeFeedForward)], hidden_states.new_zeros(1).squeeze())
         return hidden_states, presents, aux_loss
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
