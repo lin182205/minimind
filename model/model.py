@@ -64,7 +64,7 @@ def Precompute_freqs_cis(dim: int, end: int = 32*1024, rope_base: float = 1e6, r
         beta_fast, beta_slow, factor, origin_max, attn_factor = (
             rope_scaling.get("beta_fast", 32.0), rope_scaling.get("beta_slow", 1.0), 
             rope_scaling.get("factor", 16),
-            rope_scaling.get("oringinal_max_position_embeddings", 2048), 
+            rope_scaling.get("original_max_position_embeddings", 2048), 
             rope_scaling.get("attention_factor", 1.0)
         )
         if end > origin_max:
@@ -180,7 +180,7 @@ class MoeFeedForward(nn.Module):
             self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
         else:
             self.aux_loss = scores.new_zeros(1).squeeze()
-            return y.view(batch_size, seq_len, hidden_dim)
+        return y.view(batch_size, seq_len, hidden_dim)
 
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
@@ -263,27 +263,37 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
 
     @torch.inference_mode()
     def generate(self, inputs=None, attention_mask=None, max_new_tokens=8192, temperature=0.85, top_p=0.85, top_k=50, eos_token_id=2, streamer=None, use_cache=True, num_return_sequences=1, do_sample=True, repetition_penalty=1.0, **kwargs):
-        input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
+        input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)     #repeat()将每个句子复制n份，生成多份结果
         attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
         past_key_values = kwargs.pop("past_key_values", None)
-        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
-        if streamer: streamer.put(input_ids.cpu())
+        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)      #0为false
+        if streamer: streamer.put(input_ids.cpu())   #流式输出
         for _ in range(max_new_tokens):
-            past_len = past_key_values[0][0].shape[1] if past_key_values else 0
+            past_len = past_key_values[0][0].shape[1] if past_key_values else 0     #past_key_values.shape = 
+                                                                                                            #  [K0, V0],   # 第0层
+                                                                                                            #  [K1, V1],   # 第1层
+                                                                                                            #  [K2, V2],   # 第2层
+                                                                                    #k.shape = [B, seq_len, num_kv_heads, head_dim]
             outputs = self.forward(input_ids[:, past_len:], attention_mask, past_key_values, use_cache=use_cache, **kwargs)
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
-            logits = outputs.logits[:, -1, :] / temperature
+            #attention_mask.shape = [B, Len] 一个样本为一条sequence
+
+            logits = outputs.logits[:, -1, :] / temperature #[B, L, V]
             if repetition_penalty != 1.0:
-                for i in range(input_ids.shape[0]):
+                for i in range(input_ids.shape[0]):     #input_ids.shape= [B, L]
                     seen = torch.unique(input_ids[i]); score = logits[i, seen]; logits[i, seen] = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
-            if top_k > 0: 
+                    #降低出现过的token的采样概率
+
+            if top_k > 0:   #topk返回两个张量[B, 值]  [B, 索引]
                 logits[logits < torch.topk(logits, top_k)[0][..., -1, None]] = -float('inf')
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 mask = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1) > top_p
                 mask[..., 1:], mask[..., 0] = mask[..., :-1].clone(), 0
                 logits[mask.scatter(1, sorted_indices, mask)] = -float('inf')
+
             next_token = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1) if do_sample else torch.argmax(logits, dim=-1, keepdim=True)
+
             if eos_token_id is not None: next_token = torch.where(finished.unsqueeze(-1), next_token.new_full((next_token.shape[0], 1), eos_token_id), next_token)
             input_ids = torch.cat([input_ids, next_token], dim=-1)
             past_key_values = outputs.past_key_values if use_cache else None
